@@ -1,0 +1,324 @@
+// Arduino Smart Water Distribution System Controller
+// This code reads sensors, controls pumps/valves, and communicates with a Raspberry Pi.
+
+// ---------------------------------------------------------------------------------
+// Step 1: Include Libraries (if any are needed)
+// ---------------------------------------------------------------------------------
+// For the HC-SR04 Ultrasonic Sensor, we don't strictly need a library,
+// but NewPing can make it easier. For now, we'll do it manually.
+
+// ---------------------------------------------------------------------------------
+// Step 2: Define Pins for Sensors and Actuators
+// ---------------------------------------------------------------------------------
+// --- SENSORS ---
+// Ultrasonic Sensor (Water Level)
+const int ULTRASONIC_TRIG_PIN = 6; // Digital Pin 6 for Trigger
+const int ULTRASONIC_ECHO_PIN = 5; // Digital Pin 5 for Echo
+
+// Flow Sensor (YF-S201)
+const int FLOW_SENSOR_PIN = 3;     // Digital Pin 3 (must support interrupts, Pin 2 or 3 are good on Uno)
+                                   // Connect to the signal wire of the flow sensor.
+
+// Pressure Sensor (Analog)
+const int PRESSURE_SENSOR_PIN = A0; // Analog Pin A0
+
+// --- ACTUATORS (Relays controlling devices) ---
+// IMPORTANT NOTE ON PIN 1:
+// Digital Pin 1 (TX) is used for Serial communication with the Raspberry Pi.
+// You CANNOT use it for Solenoid Valve 1 if you are using Serial.
+// I've changed Solenoid Valve 1 to Pin 4. If you must use Pin 1 for something else,
+// you'd need a different way to communicate or a different Arduino board (like a Mega).
+const int PUMP_1_RELAY_PIN = 10;    // Digital Pin 10 for Submersible Pump 1
+const int PUMP_2_RELAY_PIN = 2;     // Digital Pin 2 for Pump 2
+const int SOLENOID_VALVE_1_PIN = 4; // Digital Pin 4 for Solenoid Valve 1 (Changed from Pin 1)
+const int SOLENOID_VALVE_2_PIN = 11;    // Digital Pin 11 for Solenoid Valve 2
+
+// ---------------------------------------------------------------------------------
+// Step 3: Global Variables for Sensor Readings and Statuses
+// ---------------------------------------------------------------------------------
+// --- Water Level Sensor ---
+float waterLevelCm = 0.0;         // Calculated water level in cm from bottom of tank
+float waterLevelPercent = 0.0;    // Water level as a percentage
+const float TANK_HEIGHT_EMPTY_CM = 24.0; // Distance from sensor to water when tank is empty
+const float TANK_HEIGHT_FULL_CM = 3.0;   // Distance from sensor to water when tank is full
+
+// --- Flow Sensor ---
+volatile unsigned long pulseCount = 0; // Counts pulses from flow sensor (volatile for ISR)
+float flowRateLPM = 0.0;               // Flow rate in Liters Per Minute
+unsigned long lastFlowReadTime = 0;    // To calculate flow rate over a period
+// Calibration Factor for YF-S201:
+// Typically, this sensor gives about 450 pulses per liter.
+// So, Flow Rate (Liters/Minute) = (Frequency in Hz * 60) / 450
+// Which simplifies to Frequency / 7.5.
+// You might need to fine-tune this K_FACTOR by testing.
+const float FLOW_K_FACTOR = 7.5; // For YF-S201, this is pulses_per_second / (Liters/Minute)
+
+// --- Pressure Sensor ---
+float pressurePsi = 0.0;           // Pressure in PSI
+const float MAX_PRESSURE_PSI = 30.0; // Maximum pressure your sensor can read (e.g., 30 PSI)
+const float ARDUINO_VOLTAGE = 5.0;   // Arduino operating voltage (usually 5V)
+
+// --- Actuator Statuses (0 = OFF, 1 = ON) ---
+int pump1Status = 0;
+int pump2Status = 0;
+int valve1Status = 0;
+int valve2Status = 0;
+
+// --- Serial Communication ---
+String incomingPiCommand = ""; // Stores commands from Raspberry Pi
+
+// ---------------------------------------------------------------------------------
+// Step 4: The setup() Function - Runs once when Arduino starts
+// ---------------------------------------------------------------------------------
+void setup() {
+  // Initialize Serial Communication (for talking to Raspberry Pi)
+  Serial.begin(9600); // Use 9600 baud rate. Make sure Pi uses the same.
+  Serial.println("Arduino SCADA RTU Initialized. Waiting for commands...");
+
+  // Initialize Sensor Pins
+  pinMode(ULTRASONIC_TRIG_PIN, OUTPUT);
+  pinMode(ULTRASONIC_ECHO_PIN, INPUT);
+  pinMode(FLOW_SENSOR_PIN, INPUT_PULLUP); // Use INPUT_PULLUP if your sensor needs it, otherwise INPUT
+
+  // Initialize Actuator Pins (all OFF initially)
+  pinMode(PUMP_1_RELAY_PIN, OUTPUT);
+  digitalWrite(PUMP_1_RELAY_PIN, LOW); // LOW usually means OFF for relays (check your relay module)
+  pump1Status = 0;
+
+  pinMode(PUMP_2_RELAY_PIN, OUTPUT);
+  digitalWrite(PUMP_2_RELAY_PIN, LOW);
+  pump2Status = 0;
+
+  pinMode(SOLENOID_VALVE_1_PIN, OUTPUT);
+  digitalWrite(SOLENOID_VALVE_1_PIN, LOW);
+  valve1Status = 0;
+
+  pinMode(SOLENOID_VALVE_2_PIN, OUTPUT);
+  digitalWrite(SOLENOID_VALVE_2_PIN, LOW);
+  valve2Status = 0;
+
+  // Attach Interrupt for Flow Sensor
+  // The function 'countPulse' will be called on every RISING edge of the signal from FLOW_SENSOR_PIN
+  attachInterrupt(digitalPinToInterrupt(FLOW_SENSOR_PIN), countPulse, RISING);
+  lastFlowReadTime = millis(); // Initialize time for flow calculation
+}
+
+// ---------------------------------------------------------------------------------
+// Step 5: The loop() Function - Runs repeatedly
+// ---------------------------------------------------------------------------------
+void loop() {
+  // 1. Read all sensor data
+  readUltrasonicSensor();
+  readFlowSensor();
+  readPressureSensor();
+
+  // 2. Send data to Raspberry Pi
+  sendDataToPi();
+
+  // 3. Check for and process commands from Raspberry Pi
+  receiveAndProcessCommands();
+
+  // Add a small delay to make the system responsive but not overwhelming
+  delay(1000); // Send data and check for commands every 1 second. Adjust as needed.
+}
+
+// ---------------------------------------------------------------------------------
+// Step 6: Sensor Reading Functions
+// ---------------------------------------------------------------------------------
+
+// --- Read Ultrasonic Sensor (Water Level) ---
+void readUltrasonicSensor() {
+  long duration;
+  float distanceCm;
+
+  // Clear the trigPin
+  digitalWrite(ULTRASONIC_TRIG_PIN, LOW);
+  delayMicroseconds(2);
+
+  // Sets the trigPin on HIGH state for 10 micro seconds
+  digitalWrite(ULTRASONIC_TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(ULTRASONIC_TRIG_PIN, LOW);
+
+  // Reads the echoPin, returns the sound wave travel time in microseconds
+  duration = pulseIn(ULTRASONIC_ECHO_PIN, HIGH);
+
+  // Calculate the distance
+  // Speed of sound wave divided by two (go and back)
+  // Speed of sound = 343 m/s = 0.0343 cm/microsecond
+  distanceCm = duration * 0.0343 / 2.0;
+
+  // Calculate water level percentage
+  // When distance is TANK_HEIGHT_EMPTY_CM (e.g., 24cm), level is 0%
+  // When distance is TANK_HEIGHT_FULL_CM (e.g., 3cm), level is 100%
+  // map(value, fromLow, fromHigh, toLow, toHigh)
+  waterLevelPercent = map(distanceCm, TANK_HEIGHT_EMPTY_CM, TANK_HEIGHT_FULL_CM, 0, 100);
+  waterLevelPercent = constrain(waterLevelPercent, 0, 100); // Ensure it's between 0 and 100
+
+  // You can also calculate actual water depth if needed:
+  // waterLevelCm = TANK_HEIGHT_EMPTY_CM - distanceCm;
+  // waterLevelCm = constrain(waterLevelCm, 0, TANK_HEIGHT_EMPTY_CM - TANK_HEIGHT_FULL_CM);
+}
+
+// --- Interrupt Service Routine (ISR) for Flow Sensor ---
+void countPulse() {
+  pulseCount++;
+}
+
+// --- Read Flow Sensor ---
+void readFlowSensor() {
+  unsigned long currentTime = millis();
+  unsigned long elapsedTime = currentTime - lastFlowReadTime;
+
+  if (elapsedTime > 1000) { // Calculate every second
+    // Detach interrupt temporarily to read pulseCount safely
+    detachInterrupt(digitalPinToInterrupt(FLOW_SENSOR_PIN));
+    
+    // Calculate frequency (Hz = pulses per second)
+    float frequency = (float)pulseCount / (elapsedTime / 1000.0); // pulses / seconds
+    
+    // Calculate flow rate using the K-factor
+    // Flow Rate (Liters/Minute) = Frequency / K_FACTOR (if K_FACTOR is freq_hz / (L/min))
+    // Or, Flow Rate (Liters/Minute) = (Frequency * 60) / Pulses_Per_Liter
+    // Using K_FACTOR = 7.5 (for YF-S201, freq_hz / (L/min))
+    flowRateLPM = frequency / FLOW_K_FACTOR;
+
+    // Reset pulse count and update time for next reading
+    pulseCount = 0;
+    lastFlowReadTime = currentTime;
+
+    // Re-attach interrupt
+    attachInterrupt(digitalPinToInterrupt(FLOW_SENSOR_PIN), countPulse, RISING);
+  }
+}
+
+// --- Read Pressure Sensor ---
+void readPressureSensor() {
+  int sensorValue = analogRead(PRESSURE_SENSOR_PIN); // Reads 0-1023
+
+  // Convert the analog reading (0-1023) to pressure (0-MAX_PRESSURE_PSI)
+  // Assuming a linear sensor where 0V = 0 PSI and 5V (or max ADC voltage) = MAX_PRESSURE_PSI
+  pressurePsi = ( (float)sensorValue / 1023.0) * MAX_PRESSURE_PSI;
+}
+
+// ---------------------------------------------------------------------------------
+// Step 7: Actuator Control Functions
+// ---------------------------------------------------------------------------------
+// These functions will be called based on commands from the Raspberry Pi.
+// Relay HIGH = ON, LOW = OFF (this might be inverted for your relay module, adjust if needed)
+
+void setPump1(bool on) {
+  if (on) {
+    digitalWrite(PUMP_1_RELAY_PIN, HIGH);
+    pump1Status = 1;
+    Serial.println("CMD_ACK: Pump 1 ON");
+  } else {
+    digitalWrite(PUMP_1_RELAY_PIN, LOW);
+    pump1Status = 0;
+    Serial.println("CMD_ACK: Pump 1 OFF");
+  }
+}
+
+void setPump2(bool on) {
+  if (on) {
+    digitalWrite(PUMP_2_RELAY_PIN, HIGH);
+    pump2Status = 1;
+    Serial.println("CMD_ACK: Pump 2 ON");
+  } else {
+    digitalWrite(PUMP_2_RELAY_PIN, LOW);
+    pump2Status = 0;
+    Serial.println("CMD_ACK: Pump 2 OFF");
+  }
+}
+
+void setSolenoidValve1(bool open) {
+  if (open) {
+    digitalWrite(SOLENOID_VALVE_1_PIN, HIGH);
+    valve1Status = 1;
+    Serial.println("CMD_ACK: Valve 1 OPEN");
+  } else {
+    digitalWrite(SOLENOID_VALVE_1_PIN, LOW);
+    valve1Status = 0;
+    Serial.println("CMD_ACK: Valve 1 CLOSED");
+  }
+}
+
+void setSolenoidValve2(bool open) {
+  if (open) {
+    digitalWrite(SOLENOID_VALVE_2_PIN, HIGH);
+    valve2Status = 1;
+    Serial.println("CMD_ACK: Valve 2 OPEN");
+  } else {
+    digitalWrite(SOLENOID_VALVE_2_PIN, LOW);
+    valve2Status = 0;
+    Serial.println("CMD_ACK: Valve 2 CLOSED");
+  }
+}
+
+// ---------------------------------------------------------------------------------
+// Step 8: Communication Functions
+// ---------------------------------------------------------------------------------
+
+// --- Send Data to Raspberry Pi ---
+// Format: "L:<level%>,P:<pressurePSI>,F:<flowLPM>,S1:<P1_status>,S2:<P2_status>,S3:<V1_status>,S4:<V2_status>"
+void sendDataToPi() {
+  String dataString = "L:" + String(waterLevelPercent, 1) +
+                      ",P:" + String(pressurePsi, 2) +
+                      ",F:" + String(flowRateLPM, 2) +
+                      ",S1:" + String(pump1Status) +
+                      ",S2:" + String(pump2Status) +
+                      ",S3:" + String(valve1Status) +
+                      ",S4:" + String(valve2Status);
+  Serial.println(dataString);
+}
+
+// --- Receive and Process Commands from Raspberry Pi ---
+void receiveAndProcessCommands() {
+  if (Serial.available() > 0) {
+    incomingPiCommand = Serial.readStringUntil('\n'); // Read the command until newline
+    incomingPiCommand.trim(); // Remove any leading/trailing whitespace
+
+    // --- Process Commands ---
+    // Example commands from Pi: "P1ON", "P1OFF", "P2ON", "P2OFF", "V1ON", "V1OFF", "V2ON", "V2OFF"
+    if (incomingPiCommand.equalsIgnoreCase("P1ON")) {
+      setPump1(true);
+    } else if (incomingPiCommand.equalsIgnoreCase("P1OFF")) {
+      setPump1(false);
+    } else if (incomingPiCommand.equalsIgnoreCase("P2ON")) {
+      setPump2(true);
+    } else if (incomingPiCommand.equalsIgnoreCase("P2OFF")) {
+      setPump2(false);
+    } else if (incomingPiCommand.equalsIgnoreCase("V1ON")) { // "ON" for valve means "OPEN"
+      setSolenoidValve1(true);
+    } else if (incomingPiCommand.equalsIgnoreCase("V1OFF")) { // "OFF" for valve means "CLOSE"
+      setSolenoidValve1(false);
+    } else if (incomingPiCommand.equalsIgnoreCase("V2ON")) {
+      setSolenoidValve2(true);
+    } else if (incomingPiCommand.equalsIgnoreCase("V2OFF")) {
+      setSolenoidValve2(false);
+    } else {
+      Serial.print("CMD_ERR: Unknown command: ");
+      Serial.println(incomingPiCommand);
+    }
+    incomingPiCommand = ""; // Clear for next command
+  }
+}
+
+// ---------------------------------------------------------------------------------
+// End of Arduino Code
+// ---------------------------------------------------------------------------------
+// Next Steps:
+// 1. Wire your Arduino, sensors, and relays according to the pin definitions.
+//    - Ultrasonic: TRIG_PIN to Trig, ECHO_PIN to Echo, VCC to 5V, GND to GND.
+//    - Flow Sensor: Signal to FLOW_SENSOR_PIN (D3), VCC to 5V, GND to GND.
+//    - Pressure Sensor: Signal to PRESSURE_SENSOR_PIN (A0), VCC to 5V, GND to GND.
+//    - Relays: Control pins (IN1, IN2 etc.) to PUMP/VALVE pins, VCC/JD-VCC to 5V (or separate supply if needed), GND to GND.
+//      Connect pumps/valves to the relay output terminals.
+//      BE VERY CAREFUL WITH MAINS VOLTAGE IF YOUR PUMPS/VALVES USE IT.
+// 2. Upload this code to your Arduino.
+// 3. Open the Arduino Serial Monitor (set baud rate to 9600). You should see data output.
+// 4. Try sending commands like "P2ON" (then press Enter) via the Serial Monitor's input field
+//    to test if the relays respond. You should see "CMD_ACK: Pump 2 ON".
+//
+// After this, we'll move to the Raspberry Pi Python script.
+// ---------------------------------------------------------------------------------
