@@ -1,0 +1,373 @@
+# Raspberry Pi Smart Water System Controller Script with Flask API
+# This script communicates with an Arduino, processes sensor data,
+# implements control logic, and provides a Flask API for a client app.
+
+import serial
+import time
+import re
+from flask import Flask, jsonify, request
+import threading # To run Flask in a separate thread
+
+# ---------------------------------------------------------------------------------
+# Configuration Constants
+# ---------------------------------------------------------------------------------
+SERIAL_PORT = '/dev/ttyUSB0'  # Serial port for Arduino connection
+BAUD_RATE = 9600
+RECONNECT_DELAY_SECONDS = 5   # How long to wait before trying to reconnect to Arduino
+
+# --- Tank Level Thresholds (as percentages) ---
+WATER_LEVEL_LOW_THRESHOLD_PERCENT = 20.0
+WATER_LEVEL_HIGH_THRESHOLD_PERCENT = 95.0
+
+# --- Alarm Thresholds (as percentages) ---
+WATER_LEVEL_ALARM_LOW_PERCENT = 10.0
+WATER_LEVEL_ALARM_HIGH_PERCENT = 98.0
+
+# --- Fault Detection ---
+PRESSURE_DROP_FAULT_FACTOR = 0.7
+MIN_FLOW_FOR_PRESSURE_FAULT_CHECK_LPM = 1.0
+
+# --- Flask Configuration ---
+FLASK_HOST = '0.0.0.0'  # Listen on all network interfaces
+FLASK_PORT = 5000       # Port for the Flask API
+
+# --- Global state variables ---
+# Using a lock for thread-safe access to shared data
+data_lock = threading.Lock()
+current_data = {
+    "water_level_percent": 0.0,
+    "pressure_psi": 0.0,
+    "flow_rate_lpm": 0.0,
+    "pump1_status": 0,
+    "pump2_status": 0,
+    "valve1_status": 0,
+    "valve2_status": 0,
+    "general_alarm": "No alarms", # Added alarm to current_data
+    "last_updated": time.time()
+}
+previous_pressure_psi = 0.0
+arduino_connected = False
+ser = None # Serial object
+
+# User control for Pump 2 and Valve 2 (can be overridden by API)
+user_wants_pump2_valve2_on = False
+# --- End Global state variables ---
+
+app = Flask(__name__)
+
+# ---------------------------------------------------------------------------------
+# Arduino Communication and Control Logic (mostly unchanged)
+# ---------------------------------------------------------------------------------
+def connect_to_arduino():
+    global ser, arduino_connected
+    try:
+        ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
+        time.sleep(2) # Wait for Arduino to reset
+        if ser.is_open:
+            print(f"Successfully connected to Arduino on {SERIAL_PORT}")
+            arduino_connected = True
+            for _ in range(5): # Clear initial buffer
+                if ser.in_waiting: ser.readline()
+                else: break
+            return True
+    except serial.SerialException as e:
+        print(f"Error connecting to Arduino: {e}")
+        arduino_connected = False
+        if ser: ser.close()
+        return False
+
+def send_command_to_arduino(command):
+    global arduino_connected
+    if ser and ser.is_open and arduino_connected:
+        try:
+            print(f"Sending command to Arduino: {command}")
+            ser.write(command.encode('utf-8') + b'\n')
+            ser.flush()
+            # Consider reading ACK here if Arduino sends one
+        except serial.SerialException as e:
+            print(f"Error sending command: {e}")
+            arduino_connected = False
+        except Exception as e:
+            print(f"An unexpected error occurred while sending command: {e}")
+            arduino_connected = False
+    else:
+        print("Cannot send command: Arduino not connected or serial port not open.")
+
+def parse_arduino_data(data_line):
+    global current_data, previous_pressure_psi # Ensure this global is used if modifying current_data
+    try:
+        # This is a critical section, ensure thread safety if other threads modify current_data
+        # However, only this function (called by main_logic_thread) modifies these specific sensor values
+        # previous_pressure_psi is read here and in check_alarms_and_faults
+        
+        temp_previous_pressure = current_data["pressure_psi"] # Read before potential update
+
+        match = re.match(
+            r"L:([\d.]+),P:([\d.]+),F:([\d.]+),S1:([01]),S2:([01]),S3:([01]),S4:([01])",
+            data_line
+        )
+        if match:
+            with data_lock: # Protect access to current_data
+                # Update previous_pressure_psi only if a new pressure is successfully parsed
+                # This ensures previous_pressure_psi always holds the last known valid pressure
+                # before current_data["pressure_psi"] is updated.
+                previous_pressure_psi = temp_previous_pressure
+
+                current_data["water_level_percent"] = float(match.group(1))
+                current_data["pressure_psi"] = float(match.group(2))
+                current_data["flow_rate_lpm"] = float(match.group(3))
+                current_data["pump1_status"] = int(match.group(4))
+                current_data["pump2_status"] = int(match.group(5))
+                current_data["valve1_status"] = int(match.group(6))
+                current_data["valve2_status"] = int(match.group(7))
+                current_data["last_updated"] = time.time()
+            return True
+        else:
+            if data_line.startswith("CMD_ACK:") or data_line.startswith("CMD_ERR:") or data_line.startswith("Arduino SCADA RTU Initialized"):
+                print(f"Arduino Message: {data_line}") # Log these but don't treat as data parsing error
+                return False # Not a data line, but not an error in parsing structure
+            elif data_line: # If it's not empty and not recognized
+                print(f"Warning: Could not parse Arduino data line: '{data_line}'")
+            return False
+    except ValueError as e:
+        print(f"Error parsing data value: {e} in line '{data_line}'")
+        return False
+    except Exception as e:
+        print(f"An unexpected error occurred during parsing: {e} in line '{data_line}'")
+        return False
+
+
+def display_status_on_console(): # Renamed to avoid conflict with API
+    # This function reads global data, lock might be excessive if only one thread updates
+    # but good for consistency if multiple threads could potentially read.
+    with data_lock:
+        data_to_display = current_data.copy() # Work with a copy
+
+    print("\n--- SYSTEM STATUS (CONSOLE) ---")
+    print(f"  Water Level: {data_to_display['water_level_percent']:.1f}%")
+    print(f"  Pressure:    {data_to_display['pressure_psi']:.2f} PSI")
+    print(f"  Flow Rate:   {data_to_display['flow_rate_lpm']:.2f} LPM")
+    print(f"  Pump 1:      {'ON' if data_to_display['pump1_status'] == 1 else 'OFF'}")
+    print(f"  Pump 2:      {'ON' if data_to_display['pump2_status'] == 1 else 'OFF'}")
+    print(f"  S. Valve 1:  {'OPEN' if data_to_display['valve1_status'] == 1 else 'CLOSED'}")
+    print(f"  S. Valve 2:  {'OPEN' if data_to_display['valve2_status'] == 1 else 'CLOSED'}")
+    print(f"  Alarm:       {data_to_display['general_alarm']}")
+    print(f"  Desired P2/V2 (API/User): {'ON' if user_wants_pump2_valve2_on else 'OFF'}")
+    print(f"  Last Update: {time.ctime(data_to_display['last_updated'])}")
+    print("-------------------------------\n")
+
+def check_alarms_and_faults():
+    global user_wants_pump2_valve2_on # Modifying global
+    
+    alarm_msg_to_set = "No alarms" # Default
+    is_fault_active = False
+
+    # It's important to read current_data values consistently, especially if they can change.
+    # Using a local copy from within the lock ensures atomicity for the check.
+    with data_lock:
+        local_current_data = current_data.copy()
+        # previous_pressure_psi is also global, ensure its update is synchronized if needed
+        # For this logic, previous_pressure_psi is updated in parse_arduino_data, which is called by this thread.
+
+    if local_current_data["water_level_percent"] < WATER_LEVEL_ALARM_LOW_PERCENT:
+        alarm_msg_to_set = f"ALARM: LOW WATER LEVEL ({local_current_data['water_level_percent']:.1f}%)"
+    elif local_current_data["water_level_percent"] > WATER_LEVEL_ALARM_HIGH_PERCENT:
+        alarm_msg_to_set = f"ALARM: HIGH WATER LEVEL ({local_current_data['water_level_percent']:.1f}%)"
+
+    # Fault Detection for Pump 2
+    if local_current_data["pump2_status"] == 1:
+        # Check for sudden pressure drop using the global previous_pressure_psi
+        # previous_pressure_psi should have been updated just before current_data["pressure_psi"]
+        if local_current_data["pressure_psi"] < (previous_pressure_psi * PRESSURE_DROP_FAULT_FACTOR) and \
+           local_current_data["flow_rate_lpm"] > MIN_FLOW_FOR_PRESSURE_FAULT_CHECK_LPM:
+            
+            fault_msg_text = f"FAULT: Sudden pressure drop from {previous_pressure_psi:.2f} to {local_current_data['pressure_psi']:.2f} PSI while Pump 2 is ON. Possible Leakage!"
+            print(f"!!! {fault_msg_text} !!!")
+            alarm_msg_to_set = fault_msg_text # Prioritize fault message
+            is_fault_active = True
+            
+            print("!!! Turning OFF Pump 2 and Closing Solenoid Valve 2 due to fault. !!!")
+            send_command_to_arduino("P2OFF")
+            send_command_to_arduino("V2OFF")
+            user_wants_pump2_valve2_on = False # Critical: update shared state
+
+    # Update the global alarm status
+    with data_lock:
+        if current_data["general_alarm"] != alarm_msg_to_set and alarm_msg_to_set != "No alarms":
+             print(f"!!! NEW ALARM/FAULT: {alarm_msg_to_set} !!!")
+        current_data["general_alarm"] = alarm_msg_to_set
+
+
+def apply_control_logic():
+    global user_wants_pump2_valve2_on # Reading global
+    
+    # Read current_data under lock to ensure consistency
+    with data_lock:
+        local_current_data = current_data.copy()
+
+    # Pump 1 Control
+    if local_current_data["water_level_percent"] < WATER_LEVEL_LOW_THRESHOLD_PERCENT and local_current_data["pump1_status"] == 0:
+        print("Logic: Water level low, turning Pump 1 ON.")
+        send_command_to_arduino("P1ON")
+    elif local_current_data["water_level_percent"] > WATER_LEVEL_HIGH_THRESHOLD_PERCENT and local_current_data["pump1_status"] == 1:
+        print("Logic: Water level high, turning Pump 1 OFF.")
+        send_command_to_arduino("P1OFF")
+
+    # Solenoid Valve 1 Control
+    if local_current_data["water_level_percent"] > WATER_LEVEL_HIGH_THRESHOLD_PERCENT and local_current_data["valve1_status"] == 0:
+        print("Logic: Tank full, opening Solenoid Valve 1.")
+        send_command_to_arduino("V1ON")
+    elif local_current_data["water_level_percent"] < (WATER_LEVEL_HIGH_THRESHOLD_PERCENT - 5.0) and local_current_data["valve1_status"] == 1:
+        print("Logic: Tank no longer full, closing Solenoid Valve 1.")
+        send_command_to_arduino("V1OFF")
+
+    # Pump 2 and Solenoid Valve 2 Control (driven by user_wants_pump2_valve2_on)
+    # This uses the global user_wants_pump2_valve2_on which is set by the API
+    if user_wants_pump2_valve2_on:
+        if local_current_data["pump2_status"] == 0:
+            print("Logic: API desires P2 ON, turning Pump 2 ON.")
+            send_command_to_arduino("P2ON")
+        if local_current_data["valve2_status"] == 0: # Assuming valve follows pump
+            print("Logic: API desires V2 OPEN, opening Solenoid Valve 2.")
+            send_command_to_arduino("V2ON")
+    else: # User wants them OFF
+        if local_current_data["pump2_status"] == 1:
+            print("Logic: API desires P2 OFF, turning Pump 2 OFF.")
+            send_command_to_arduino("P2OFF")
+        if local_current_data["valve2_status"] == 1: # Assuming valve follows pump
+            print("Logic: API desires V2 CLOSED, closing Solenoid Valve 2.")
+            send_command_to_arduino("V2OFF")
+
+# ---------------------------------------------------------------------------------
+# Flask API Endpoints
+# ---------------------------------------------------------------------------------
+@app.route('/api/data', methods=['GET'])
+def get_data():
+    with data_lock:
+        # Return a copy to avoid issues if current_data is modified while jsonify is processing
+        data_to_send = current_data.copy()
+    return jsonify(data_to_send)
+
+@app.route('/api/control/pump2', methods=['POST'])
+def control_pump2():
+    global user_wants_pump2_valve2_on # Modifying global
+    try:
+        command_data = request.get_json()
+        if not command_data or 'state' not in command_data:
+            return jsonify({"error": "Missing 'state' in JSON payload"}), 400
+        
+        command = command_data['state'].upper()
+        
+        response_message = ""
+        if command == "ON":
+            user_wants_pump2_valve2_on = True
+            response_message = "Pump 2 and Valve 2 command set to ON"
+            print(f"API Command: Pump 2 / Valve 2 set to ON by API request.")
+        elif command == "OFF":
+            user_wants_pump2_valve2_on = False
+            response_message = "Pump 2 and Valve 2 command set to OFF"
+            print(f"API Command: Pump 2 / Valve 2 set to OFF by API request.")
+        else:
+            return jsonify({"error": "Invalid state. Must be 'ON' or 'OFF'."}), 400
+        
+        # The apply_control_logic in the main loop will pick up the change to user_wants_pump2_valve2_on
+        return jsonify({"message": response_message, "desired_state_P2_V2": "ON" if user_wants_pump2_valve2_on else "OFF"}), 200
+
+    except Exception as e:
+        print(f"Error processing /api/control/pump2: {e}")
+        return jsonify({"error": "An internal error occurred"}), 500
+
+# ---------------------------------------------------------------------------------
+# Main Background Thread for Arduino Communication and Logic
+# ---------------------------------------------------------------------------------
+def main_logic_thread():
+    global arduino_connected, ser, user_wants_pump2_valve2_on # Accessing globals
+
+    print("Main logic thread started.")
+    while True:
+        if not arduino_connected or not ser or not ser.is_open:
+            print("Arduino not connected in main_logic_thread. Attempting to reconnect...")
+            if connect_to_arduino():
+                print("Reconnected to Arduino in main_logic_thread.")
+                # Ensure initial state for P2/V2 based on user_wants...
+                # This is important if connection drops and P2/V2 were on.
+                # The apply_control_logic will handle this based on current user_wants_pump2_valve2_on
+                initial_p2_command = "P2ON" if user_wants_pump2_valve2_on else "P2OFF"
+                initial_v2_command = "V2ON" if user_wants_pump2_valve2_on else "V2OFF"
+                send_command_to_arduino(initial_p2_command)
+                send_command_to_arduino(initial_v2_command)
+            else:
+                # If connection failed, update status and wait before retrying
+                with data_lock:
+                    current_data["general_alarm"] = "Arduino Connection Lost"
+                time.sleep(RECONNECT_DELAY_SECONDS)
+                continue # Skip the rest of the loop if connection failed
+
+        # Read data from Arduino
+        if ser and ser.in_waiting > 0:
+            try:
+                raw_line = ser.readline()
+                data_line = raw_line.decode('utf-8').strip()
+                if data_line:
+                    if parse_arduino_data(data_line):
+                        # Data successfully parsed and current_data updated
+                        display_status_on_console() # For RPi console debugging
+                        check_alarms_and_faults()
+                        apply_control_logic() # Apply logic after new data is parsed & alarms checked
+                    # else: data line was not a valid data string (e.g. ACK, ERR, or malformed)
+            except serial.SerialException as e:
+                print(f"Serial error during read in main_logic_thread: {e}")
+                arduino_connected = False # Assume connection lost
+                if ser: ser.close()
+                with data_lock:
+                    current_data["general_alarm"] = "Arduino Communication Error"
+            except UnicodeDecodeError:
+                print(f"UnicodeDecodeError in main_logic_thread: Could not decode {raw_line}. Skipping line.")
+            except Exception as e:
+                print(f"An unexpected error occurred in main_logic_thread (read/parse): {e}")
+                # Potentially set arduino_connected to False here too
+        
+        # If no data from Arduino, we still might need to apply control logic
+        # if user_wants_pump2_valve2_on changed via API, but there's no new sensor data.
+        # However, apply_control_logic is already called after successful parsing.
+        # A periodic call here might be redundant or cause rapid toggling if not careful.
+        # For now, logic is applied upon receiving new data.
+        # Consider if control logic needs to run even without new Arduino data (e.g. if API changes state)
+        # This is implicitly handled as apply_control_logic uses the latest user_wants_pump2_valve2_on
+
+        time.sleep(1) # Main loop delay for Arduino communication cycle
+
+# ---------------------------------------------------------------------------------
+# Program Entry Point
+# ---------------------------------------------------------------------------------
+if __name__ == "__main__":
+    print("Starting Smart Water SCADA System with Flask API...")
+
+    # Start the main logic thread (Arduino comms, control logic)
+    logic_thread = threading.Thread(target=main_logic_thread, daemon=True)
+    logic_thread.start()
+
+    # Start the Flask web server
+    # Note: Flask's development server is not recommended for production.
+    # For production, use a proper WSGI server like Gunicorn or Waitress.
+    print(f"Flask API server starting on http://{FLASK_HOST}:{FLASK_PORT}")
+    try:
+        app.run(host=FLASK_HOST, port=FLASK_PORT, debug=False, use_reloader=False)
+        # debug=False and use_reloader=False are important when running threads
+    except Exception as e:
+        print(f"Failed to start Flask server: {e}")
+    finally:
+        print("Flask server stopped.")
+        # Perform any cleanup if needed when Flask server stops
+        # The main_logic_thread is a daemon, so it will exit when the main thread (Flask) exits.
+        # Ensure Arduino actuators are off if desired.
+        if ser and ser.is_open:
+            print("Ensuring all actuators are off before exiting main program...")
+            send_command_to_arduino("P1OFF")
+            send_command_to_arduino("P2OFF")
+            send_command_to_arduino("V1OFF")
+            send_command_to_arduino("V2OFF")
+            time.sleep(0.5)
+            ser.close()
+            print("Serial port closed.")
+        print("Exiting Smart Water Controller program.")
